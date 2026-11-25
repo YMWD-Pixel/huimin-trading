@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Huimin trading bot v1 — Binance USDT-margined futures, ETHUSDT only.
+"""Huimin trading bot v1.1 — Binance USDT-margined futures, ETHUSDT only.
 Style: 熬鹰 (see trading-style-aoying.md):
   - event-driven / range "打地鼠": fade the edges of the recent 24h range,
     only when momentum is NOT running away (no breakout chasing);
@@ -7,7 +7,12 @@ Style: 熬鹰 (see trading-style-aoying.md):
   - no setup = no trade. Empty positions are also a position.
 Risk rules (hard):
   - max 2% of balance risked per trade; stop-loss on every trade;
-  - daily realized loss cap $5 -> no new trades that day;
+  - daily realized loss cap $5 (bot's own trades only, v1.1)
+    -> no new trades that day. v1 counted the whole account's
+    ETHUSDT realized PnL, so YM's manual trades could block the bot
+    for a day even when the bot lost nothing; v1.1 attributes PnL
+    per bot trade instead (income snapshot at entry vs at close,
+    tracked in state.json) and only counts that.
   - balance < $50 -> halt everything and log;
   - max 1 open position; 2h cooldown after a close.
 Stdlib only. Reads key/secret from ~/.binance/credentials (mode 600).
@@ -92,12 +97,31 @@ def signed(path, params=None, method="GET"):
         raise RuntimeError(f"HTTP {e.code} {path}: {body}")
 
 
+def utc_date_str(ts=None):
+    return time.strftime("%Y-%m-%d", time.gmtime(ts))
+
+
 def load_state():
     try:
         with open(STATE_FILE) as f:
             return json.load(f)
     except Exception:
-        return {"last_close_ts": 0, "trades": 0, "wins": 0, "losses": 0}
+        return {"last_close_ts": 0, "trades": 0, "wins": 0, "losses": 0,
+                "bot_pnl_date": utc_date_str(), "bot_pnl_today": 0.0,
+                "entry_pnl": None, "entry_date": None,
+                "had_position": False}
+
+
+def rollover_bot_pnl(state):
+    """Reset the bot-attributed daily PnL at UTC midnight.
+    Keeps entry_pnl/entry_date so a position open across midnight is
+    still detected on close (its PnL is then left unattributed rather
+    than misattributed — see the close handler)."""
+    today = utc_date_str()
+    if state.get("bot_pnl_date") != today:
+        state["bot_pnl_date"] = today
+        state["bot_pnl_today"] = 0.0
+    return state.get("bot_pnl_today", 0.0)
 
 
 def save_state(s):
@@ -197,7 +221,7 @@ def open_trade(side, qty, stop_price, tp_price):
 
 def main():
     acct = signed("/fapi/v2/account")
-    log(f"bot v1 start | canTrade={acct.get('canTrade')} "
+    log(f"bot v1.1 start | canTrade={acct.get('canTrade')} "
         f"wallet={acct.get('totalWalletBalance')}")
     if not acct.get("canTrade"):
         log("FATAL: canTrade is False, exiting")
@@ -237,11 +261,15 @@ def main():
                 if time.time() - state.get("last_close_ts", 0) < COOLDOWN_SEC:
                     time.sleep(CHECK_SEC)
                     continue
-                # daily loss cap
-                pnl_today = today_realized_pnl()
-                if pnl_today <= -DAILY_LOSS_CAP:
-                    log(f"daily loss cap hit: realized today "
-                        f"${pnl_today:.2f} -> no new trades today")
+                # daily loss cap — bot's own PnL only (v1.1). YM's manual
+                # trades no longer block the bot; account PnL is logged
+                # for reference only.
+                acct_pnl_today = today_realized_pnl()
+                bot_pnl = rollover_bot_pnl(state)
+                if bot_pnl <= -DAILY_LOSS_CAP:
+                    log(f"daily loss cap hit: bot pnl today "
+                        f"${bot_pnl:.2f} (account ${acct_pnl_today:.2f}) "
+                        f"-> no new trades today")
                     time.sleep(3600)
                     continue
                 # evaluate setup
@@ -253,7 +281,8 @@ def main():
                     log(f"watch price={price:.2f} 24h=[{rg['low24']:.2f},"
                         f"{rg['high24']:.2f}] width={range_w*100:.1f}% "
                         f"1h_chg={chg1h*100:+.2f}% "
-                        f"bal=${balance:.2f} pnl_today=${pnl_today:.2f}")
+                        f"bal=${balance:.2f} pnl_bot=${bot_pnl:.2f} "
+                        f"pnl_acct=${acct_pnl_today:.2f}")
                 # range too tight to fade: skip (avoid noise trading)
                 if range_w < 0.03:
                     time.sleep(CHECK_SEC)
@@ -269,6 +298,10 @@ def main():
                             f"{rg['high24']:.2f} stop={stop:.2f} "
                             f"tp={tp:.2f} qty={qty:.3f} risk="
                             f"${balance*RISK_PCT:.2f}")
+                        # v1.1: snapshot account realized PnL at entry so
+                        # this trade's PnL = close snapshot minus this one
+                        state["entry_pnl"] = acct_pnl_today
+                        state["entry_date"] = utc_date_str()
                         open_trade("SHORT", qty,
                                    round(stop, 2), round(tp, 2))
                         state["trades"] = state.get("trades", 0) + 1
@@ -284,6 +317,10 @@ def main():
                             f"{rg['low24']:.2f} stop={stop:.2f} "
                             f"tp={tp:.2f} qty={qty:.3f} risk="
                             f"${balance*RISK_PCT:.2f}")
+                        # v1.1: snapshot account realized PnL at entry (see
+                        # SHORT branch) so only this trade's PnL counts
+                        state["entry_pnl"] = acct_pnl_today
+                        state["entry_date"] = utc_date_str()
                         open_trade("LONG", qty,
                                    round(stop, 2), round(tp, 2))
                         state["trades"] = state.get("trades", 0) + 1
@@ -324,8 +361,31 @@ def main():
             elif state.get("had_position"):
                 state["had_position"] = False
                 state["last_close_ts"] = time.time()
-                pnl = today_realized_pnl()
-                log(f"POSITION CLOSED. realized today=${pnl:.2f}")
+                pnl_now = today_realized_pnl()
+                entry_pnl = state.get("entry_pnl")
+                # v1.1: attribute only this bot trade's PnL. The snapshot
+                # is a same-UTC-day cumulative total, so it is only valid
+                # if entry and close fall on the same UTC day; a trade
+                # open across midnight (or a restart mid-trade, where the
+                # snapshot is missing) is left unattributed rather than
+                # misattributed.
+                if (entry_pnl is not None
+                        and state.get("entry_date") == utc_date_str()):
+                    trade_pnl = pnl_now - entry_pnl
+                    rollover_bot_pnl(state)
+                    state["bot_pnl_today"] = state.get("bot_pnl_today",
+                                                       0.0) + trade_pnl
+                    log(f"POSITION CLOSED. bot trade pnl=${trade_pnl:.2f} "
+                        f"bot pnl today=${state['bot_pnl_today']:.2f} "
+                        f"(account realized today=${pnl_now:.2f})")
+                else:
+                    log(f"POSITION CLOSED. bot trade pnl unknown "
+                        f"(no same-day entry snapshot, e.g. bot restarted "
+                        f"mid-trade or trade crossed UTC midnight) "
+                        f"-> not counted; account realized "
+                        f"today=${pnl_now:.2f}")
+                state["entry_pnl"] = None
+                state["entry_date"] = None
                 save_state(state)
 
             time.sleep(CHECK_SEC)
