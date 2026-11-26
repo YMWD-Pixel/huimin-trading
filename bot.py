@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Huimin trading bot v1.1 — Binance USDT-margined futures, ETHUSDT only.
+"""Huimin trading bot v1.2 — Binance USDT-margined futures, ETHUSDT only.
 Style: 熬鹰 (see trading-style-aoying.md):
   - event-driven / range "打地鼠": fade the edges of the recent 24h range,
     only when momentum is NOT running away (no breakout chasing);
@@ -13,6 +13,10 @@ Risk rules (hard):
     for a day even when the bot lost nothing; v1.1 attributes PnL
     per bot trade instead (income snapshot at entry vs at close,
     tracked in state.json) and only counts that.
+  - v1.2: hedge-mode aware. YM's account is dualSidePosition=True, so
+    every order must carry positionSide LONG/SHORT or Binance rejects
+    it with -4061. The bot reads the mode at startup and adds
+    positionSide only in hedge mode (one-way accounts unchanged).
   - balance < $50 -> halt everything and log;
   - max 1 open position; 2h cooldown after a close.
 Stdlib only. Reads key/secret from ~/.binance/credentials (mode 600).
@@ -71,6 +75,15 @@ def load_creds():
 
 
 KEY, SECRET = load_creds()
+
+# Set at startup from GET /fapi/v1/positionSide/dual. In hedge mode every
+# order must carry positionSide LONG/SHORT, else Binance rejects it -4061.
+HEDGE = False
+
+
+def _ps(side):
+    """positionSide param for an order, only in hedge mode."""
+    return {"positionSide": side} if HEDGE else {}
 
 
 def public(path, params=None):
@@ -143,11 +156,18 @@ def get_balance():
 
 def get_position():
     pos = signed("/fapi/v2/positionRisk", {"symbol": SYMBOL})
-    p = pos[0] if pos else {}
-    amt = float(p.get("positionAmt", 0))
-    return {"amt": amt, "entry": float(p.get("entryPrice", 0)),
-            "unrealized": float(p.get("unRealizedProfit", 0)),
-            "lev": p.get("leverage")}
+    # hedge mode returns one entry per side; one-way returns a single entry
+    for p in pos:
+        amt = float(p.get("positionAmt", 0))
+        if amt != 0:
+            ps = p.get("positionSide")
+            side = ps if ps in ("LONG", "SHORT") else (
+                "LONG" if amt > 0 else "SHORT")
+            return {"amt": amt, "entry": float(p.get("entryPrice", 0)),
+                    "unrealized": float(p.get("unRealizedProfit", 0)),
+                    "lev": p.get("leverage"), "side": side}
+    return {"amt": 0.0, "entry": 0.0, "unrealized": 0.0,
+            "lev": None, "side": None}
 
 
 def get_open_orders():
@@ -196,7 +216,7 @@ def open_trade(side, qty, stop_price, tp_price):
     entry_side = "BUY" if side == "LONG" else "SELL"
     exit_side = "SELL" if side == "LONG" else "BUY"
     o = place_order(symbol=SYMBOL, side=entry_side, type="MARKET",
-                    quantity=f"{qty:.3f}")
+                    quantity=f"{qty:.3f}", **_ps(side))
     log(f"ENTRY {side} qty={qty:.3f} orderId={o.get('orderId')} "
         f"status={o.get('status')}")
     fills = o.get("fills", [])
@@ -207,25 +227,33 @@ def open_trade(side, qty, stop_price, tp_price):
     try:
         s = place_order(symbol=SYMBOL, side=exit_side, type="STOP_MARKET",
                         stopPrice=f"{stop_price:.2f}", closePosition="true",
-                        workingType="MARK_PRICE", timeInForce="GTC")
+                        workingType="MARK_PRICE", timeInForce="GTC",
+                        **_ps(side))
         log(f"  STOP placed orderId={s.get('orderId')} stop={stop_price:.2f}")
     except Exception as e:
         log(f"  STOP PLACEMENT FAILED: {e} (loop will re-place it)")
     # take-profit: reduceOnly limit
     t = place_order(symbol=SYMBOL, side=exit_side, type="LIMIT",
                     price=f"{tp_price:.2f}", quantity=f"{qty:.3f}",
-                    timeInForce="GTC", reduceOnly="true")
+                    timeInForce="GTC", reduceOnly="true", **_ps(side))
     log(f"  TP placed orderId={t.get('orderId')} tp={tp_price:.2f}")
     return avg
 
 
 def main():
+    global HEDGE
     acct = signed("/fapi/v2/account")
-    log(f"bot v1.1 start | canTrade={acct.get('canTrade')} "
+    log(f"bot v1.2 start | canTrade={acct.get('canTrade')} "
         f"wallet={acct.get('totalWalletBalance')}")
     if not acct.get("canTrade"):
         log("FATAL: canTrade is False, exiting")
         return
+    try:
+        mode = signed("/fapi/v1/positionSide/dual")
+        HEDGE = bool(mode.get("dualSidePosition"))
+        log(f"position mode: {'hedge (dualSidePosition=True)' if HEDGE else 'one-way'}")
+    except Exception as e:
+        log(f"position-mode check failed, assuming one-way: {e}")
     try:
         signed("/fapi/v1/leverage",
                {"symbol": SYMBOL, "leverage": LEVERAGE}, method="POST")
@@ -343,7 +371,8 @@ def main():
                                     stopPrice=f"{stop:.2f}",
                                     closePosition="true",
                                     workingType="MARK_PRICE",
-                                    timeInForce="GTC")
+                                    timeInForce="GTC",
+                                    **_ps(pos["side"]))
                         log(f"  emergency stop placed at {stop:.2f}")
                     except Exception as e:
                         log(f"  emergency stop FAILED: {e}")
