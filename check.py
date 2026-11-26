@@ -69,7 +69,7 @@ def main():
     print("open positions:", len(open_pos))
     for p in open_pos:
         print(" ", p["symbol"], p["positionAmt"], "entry:", p["entryPrice"],
-              "unrealized:", p["unRealizedProfit"], "lev:", p["leverage"])
+              "unrealized:", p["unrealizedProfit"], "lev:", p["leverage"])
     try:
         bal = signed(key, secret, "/fapi/v2/balance")
         usdt = [b for b in bal if b["asset"] == "USDT"]
