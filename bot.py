@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""Huimin trading bot v1.3 — Binance USDT-margined futures, ETHUSDT only.
-Style: 熬鹰 (see trading-style-aoying.md):
+"""Huimin trading bot v1.4 — Binance USDT-margined futures, ETHUSDT only.
+Style: 熬鹰 (see trading-style-aoying.md) + 法师 Tony (see
+strategy-research-20261127.md):
   - event-driven / range "打地鼠": fade the edges of the recent 24h range,
     only when momentum is NOT running away (no breakout chasing);
   - low leverage (3x), every trade has a stop-loss, bank profits;
@@ -34,6 +35,15 @@ Risk rules (hard):
     no LONG when weekly is down. On 2026-11-27 the 7-day change
     was +6.7%, so the 10:07 short would have been blocked.
   - v1.3: wins/losses are now counted on close (v1.2 never did).
+  - v1.4 (YM 2026-11-27: all 7 research items): regime filter —
+    range-fade only when |7d change| <= 2%, trend markets only do
+    pullback entries WITH the trend (TP 2R); momentum confirmation
+    (entry hour must agree, skip wild 1h moves > 2%); staged
+    take-profit (stop to breakeven at +1R, take half at +1.5R,
+    trail the rest 0.5R behind the peak); scaled entries (half now,
+    half at +0.5R); loss circuit breakers (risk halves after 2
+    consecutive losses, weekly PnL -$15 halts until Monday);
+    ATR-adaptive stops; event-day blacklist (no new entries).
   - balance < $50 -> halt everything and log;
   - max 1 open position; 2h cooldown after a close.
 Stdlib only. Reads key/secret from ~/.binance/credentials (mode 600).
@@ -67,6 +77,10 @@ CHECK_SEC = 60
 QTY_STEP = 0.001
 PRICE_TICK = 0.01
 MIN_NOTIONAL = 5.0
+REGIME_CHG = 0.02        # |7d change| above this = trend market, else chop
+WEEKLY_LOSS_CAP = 15.0  # halt new trades for the week at this bot PnL
+# UTC dates with no new entries (FOMC/CPI etc.). Update monthly.
+NO_TRADE_DATES = {"2026-12-09", "2026-12-10"}
 
 
 def log(msg):
@@ -140,7 +154,11 @@ def load_state():
                 "bot_pnl_date": utc_date_str(), "bot_pnl_today": 0.0,
                 "entry_pnl": None, "entry_date": None,
                 "had_position": False, "open_stop": None, "open_tp": None,
-                "open_side": None, "stop_fail_streak": 0}
+                "open_side": None, "stop_fail_streak": 0,
+                "open_dist": None, "open_qty_full": None,
+                "scale_done": False, "tp_stage": 0, "trail_peak_r": 0.0,
+                "stop_algo_id": None, "consec_losses": 0,
+                "weekly_pnl": 0.0, "weekly_pnl_week": None}
 
 
 def rollover_bot_pnl(state):
@@ -153,6 +171,33 @@ def rollover_bot_pnl(state):
         state["bot_pnl_date"] = today
         state["bot_pnl_today"] = 0.0
     return state.get("bot_pnl_today", 0.0)
+
+
+def week_key(ts=None):
+    return time.strftime("%Y-W%W", time.gmtime(ts))
+
+
+def weekly_halt(state):
+    """True if this week's bot PnL is at/below the -$15 cap (v1.4 #5)."""
+    if state.get("weekly_pnl_week") != week_key():
+        return False
+    return state.get("weekly_pnl", 0.0) <= -WEEKLY_LOSS_CAP
+
+
+def clear_trade_state(state):
+    """Reset all per-trade fields (on close or aborted entry)."""
+    state["entry_pnl"] = None
+    state["entry_date"] = None
+    state["open_stop"] = None
+    state["open_tp"] = None
+    state["open_side"] = None
+    state["open_dist"] = None
+    state["open_qty_full"] = None
+    state["scale_done"] = False
+    state["tp_stage"] = 0
+    state["trail_peak_r"] = 0.0
+    state["stop_algo_id"] = None
+    state["stop_fail_streak"] = 0
 
 
 def save_state(s):
@@ -205,6 +250,17 @@ def cancel_all():
         log(f"algo cancel failed: {e}")
 
 
+def atr_from_klines(kl, period=14):
+    """Average True Range from klines (each row: [ts, o, h, l, c, ...])."""
+    trs = []
+    for i in range(1, len(kl)):
+        h, l = float(kl[i][2]), float(kl[i][3])
+        pc = float(kl[i - 1][4])
+        trs.append(max(h - l, abs(h - pc), abs(l - pc)))
+    trs = trs[-period:]
+    return sum(trs) / len(trs) if trs else 0.0
+
+
 def get_range():
     kl = public("/fapi/v1/klines",
                 {"symbol": SYMBOL, "interval": "1h", "limit": 24})
@@ -213,31 +269,40 @@ def get_range():
     closes = [float(k[4]) for k in kl]
     return {"high24": max(highs), "low24": min(lows),
             "last_close": closes[-1], "prev_close": closes[-2],
-            "price": closes[-1]}
+            "price": closes[-1], "cur_open": float(kl[-1][1]),
+            "atr": atr_from_klines(kl)}
 
 
-def get_weekly_trend():
-    """Weekly trend: current price vs the close 7 days ago.
-    Returns 'up' / 'down' / 'flat', or None if it cannot be fetched.
+def get_weekly_change():
+    """7-day price change (fraction), or None if it cannot be fetched.
     Daily klines, limit 8: klines[-1] is today (close = latest
-    price), klines[-8] is the close 7 days ago. +/-1% band = flat.
-    YM 2026-11-27: don't short a weekly uptrend. On 2026-11-27 the
-    7-day change was +6.7% (1623.09 -> 1731.73), so the 10:07 short
-    would have been blocked by this filter."""
+    price), klines[-8] is the close 7 days ago. On 2026-11-27 the
+    7-day change was +6.7% (1623.09 -> 1731.73)."""
     try:
         kl = public("/fapi/v1/klines",
                     {"symbol": SYMBOL, "interval": "1d", "limit": 8})
         week_ago = float(kl[-8][4])
         now = float(kl[-1][4])
-        chg = now / week_ago - 1
-        if chg > 0.01:
-            return "up"
-        if chg < -0.01:
-            return "down"
-        return "flat"
+        return now / week_ago - 1
     except Exception as e:
-        log(f"weekly trend fetch failed: {e}")
+        log(f"weekly change fetch failed: {e}")
         return None
+
+
+def r_multiple(side, entry, price, dist):
+    """How many R the position is in profit (+ = winning)."""
+    if not dist:
+        return 0.0
+    if side == "LONG":
+        return (price - entry) / dist
+    return (entry - price) / dist
+
+
+def trail_stop_price(side, entry, dist, peak_r):
+    """Trailing stop 0.5R behind the best R reached (never moves back)."""
+    if side == "LONG":
+        return entry + (peak_r - 0.5) * dist
+    return entry - (peak_r - 0.5) * dist
 
 
 def today_realized_pnl():
@@ -297,13 +362,65 @@ def close_market(side, qty):
     return o
 
 
-def open_trade(side, qty, stop_price, tp_price):
+def cancel_order(order_id):
+    return signed("/fapi/v1/order",
+                  {"symbol": SYMBOL, "orderId": order_id}, method="DELETE")
+
+
+def cancel_algo_order(algo_id):
+    return signed("/fapi/v1/algoOrder",
+                  {"symbol": SYMBOL, "algoId": algo_id}, method="DELETE")
+
+
+def find_tp_order(orders, exit_side):
+    for o in orders:
+        if (o.get("type") == "LIMIT" and o.get("side") == exit_side
+                and o.get("reduceOnly") in (True, "true")):
+            return o
+    return None
+
+
+def place_tp_limit(side, qty, tp_price):
+    """Take-profit: reduceOnly limit (regular endpoint, unaffected by
+    the -4120 algo migration)."""
+    exit_side = "SELL" if side == "LONG" else "BUY"
+    t = place_order(symbol=SYMBOL, side=exit_side, type="LIMIT",
+                    price=f"{tp_price:.2f}", quantity=f"{qty:.3f}",
+                    timeInForce="GTC", reduceOnly="true", **_ps(side))
+    log(f"  TP placed orderId={t.get('orderId')} tp={tp_price:.2f} "
+        f"qty={qty:.3f}")
+    return t
+
+
+def replace_stop(state, side, new_stop):
+    """Move the stop: cancel the old algo stop, place a new one.
+    If the cancel succeeds but the place fails, the position is
+    briefly unprotected — the manage loop re-places it next minute
+    at the stored (old, wider) level. Returns True if the new stop
+    is in place."""
+    old_id = state.get("stop_algo_id")
+    if old_id:
+        try:
+            cancel_algo_order(old_id)
+            log(f"  old stop algoId={old_id} cancelled")
+        except Exception as e:
+            log(f"  old stop cancel failed (old stop stays): {e}")
+    try:
+        s = place_stop(side, round(float(new_stop), 2))
+        state["stop_algo_id"] = s.get("algoId")
+        state["open_stop"] = round(float(new_stop), 2)
+        return True
+    except Exception as e:
+        log(f"  stop replace FAILED: {e}")
+        return False
+
+
+def open_trade(side, qty, stop_price, tp_price, state):
     """side: LONG or SHORT. Places market entry + algo stop + TP.
     Returns (avg_price, stop_ok). If the stop cannot be placed, the
     position is closed immediately — a trade without a stop is not
     held, ever (2026-11-27 lesson)."""
     entry_side = "BUY" if side == "LONG" else "SELL"
-    exit_side = "SELL" if side == "LONG" else "BUY"
     o = place_order(symbol=SYMBOL, side=entry_side, type="MARKET",
                     quantity=f"{qty:.3f}", **_ps(side))
     log(f"ENTRY {side} qty={qty:.3f} orderId={o.get('orderId')} "
@@ -314,15 +431,18 @@ def open_trade(side, qty, stop_price, tp_price):
     log(f"  entry avg price: {avg}")
     # stop-loss: Algo Order API, closePosition STOP_MARKET on mark price
     stop_ok = False
+    stop_resp = None
     for attempt in (1, 2):
         try:
-            place_stop(side, stop_price)
+            stop_resp = place_stop(side, stop_price)
             stop_ok = True
             break
         except Exception as e:
             log(f"  STOP PLACEMENT FAILED (attempt {attempt}): {e}")
             if attempt == 1:
                 time.sleep(3)
+    if stop_ok and stop_resp is not None:
+        state["stop_algo_id"] = stop_resp.get("algoId")
     if not stop_ok:
         # fail-safe: no stop -> no position. Close immediately.
         log("  CRITICAL: stop could not be placed, closing position now")
@@ -334,19 +454,172 @@ def open_trade(side, qty, stop_price, tp_price):
         return avg, False
     # take-profit: reduceOnly limit (regular endpoint, unaffected)
     try:
-        t = place_order(symbol=SYMBOL, side=exit_side, type="LIMIT",
-                        price=f"{tp_price:.2f}", quantity=f"{qty:.3f}",
-                        timeInForce="GTC", reduceOnly="true", **_ps(side))
-        log(f"  TP placed orderId={t.get('orderId')} tp={tp_price:.2f}")
+        place_tp_limit(side, qty, tp_price)
     except Exception as e:
         log(f"  TP PLACEMENT FAILED: {e} (loop will re-place it)")
     return avg, True
 
 
+def manage_open_position(pos, orders, algo_orders, state, price):
+    """Manage an open position: stop protection, TP sync, scale-in,
+    staged take-profit (breakeven -> half -> trailing stop).
+    price may be None if the price fetch failed — then only the
+    stop check runs and the R-based logic is skipped this minute."""
+    side = pos["side"]
+    exit_side = "SELL" if pos["amt"] > 0 else "BUY"
+    amt = abs(pos["amt"])
+    entry = pos["entry"]
+    dist = state.get("open_dist") or 0.0
+    # --- stop protection (v1.3, unchanged). Algo stops are invisible
+    # in openOrders — check both lists.
+    has_stop = (
+        any(o.get("type") == "STOP_MARKET" for o in orders)
+        or any(o.get("type") in ("STOP_MARKET", "STOP")
+               and o.get("side") == exit_side
+               for o in algo_orders))
+    if not has_stop:
+        log(f"WARNING: open position {pos['amt']} but NO stop "
+            f"order! entry={entry} unrealized={pos['unrealized']:.2f}")
+        stop = state.get("open_stop") or (
+            entry * 0.98 if pos["amt"] > 0 else entry * 1.02)
+        try:
+            s = place_stop(side, round(float(stop), 2))
+            state["stop_algo_id"] = s.get("algoId")
+            state["stop_fail_streak"] = 0
+            save_state(state)
+            log(f"  emergency stop placed at {stop:.2f}")
+        except Exception as e:
+            streak = state.get("stop_fail_streak", 0) + 1
+            state["stop_fail_streak"] = streak
+            save_state(state)
+            log(f"  emergency stop FAILED (streak {streak}): {e}")
+            if streak >= 3:
+                # fail-safe: a position that cannot be protected is
+                # closed, not held naked.
+                log("  CRITICAL: no stop after 3 attempts, "
+                    "closing position now")
+                try:
+                    close_market(side, amt)
+                    state["stop_fail_streak"] = 0
+                    save_state(state)
+                except Exception as e2:
+                    log(f"  CRITICAL: emergency close FAILED: {e2}")
+            return
+    if price is None or not dist:
+        return
+    # how far in profit, in R
+    r = r_multiple(side, entry, price, dist)
+    stage = state.get("tp_stage") or 0
+    # --- scale-in (v1.4 #4): at +0.5R add the second half, once.
+    # Only before any profit-taking. If the trade first goes -0.5R,
+    # no add.
+    if not state.get("scale_done") and stage == 0:
+        full_qty = state.get("open_qty_full") or amt
+        if r >= 0.5 and amt < full_qty - 1e-9:
+            add = round_down(full_qty - amt, QTY_STEP)
+            if add > 0 and add * price >= MIN_NOTIONAL:
+                try:
+                    entry_side = "BUY" if side == "LONG" else "SELL"
+                    o = place_order(symbol=SYMBOL, side=entry_side,
+                                    type="MARKET",
+                                    quantity=f"{add:.3f}", **_ps(side))
+                    log(f"  SCALE-IN {side} +{add:.3f} "
+                        f"orderId={o.get('orderId')} at R={r:.2f}")
+                    state["scale_done"] = True
+                    # TP quantity must cover the full position now
+                    tp_o = find_tp_order(orders, exit_side)
+                    if tp_o:
+                        try:
+                            cancel_order(tp_o.get("orderId"))
+                        except Exception as e:
+                            log(f"  TP cancel for re-size failed: {e}")
+                    if state.get("open_tp"):
+                        try:
+                            place_tp_limit(side, full_qty,
+                                           float(state["open_tp"]))
+                        except Exception as e:
+                            log(f"  TP re-place after scale-in "
+                                f"FAILED: {e}")
+                    save_state(state)
+                except Exception as e:
+                    log(f"  SCALE-IN FAILED: {e}")
+        elif r <= -0.5:
+            state["scale_done"] = True
+            save_state(state)
+    # --- staged take-profit (v1.4 #3)
+    # stage 0 -> 1: at +1R move the stop to breakeven
+    if stage == 0 and r >= 1.0:
+        if replace_stop(state, side, entry):
+            state["tp_stage"] = 1
+            state["trail_peak_r"] = max(
+                state.get("trail_peak_r") or 0.0, r)
+            save_state(state)
+            log(f"  STAGE 1: stop moved to breakeven {entry:.2f} "
+                f"at R={r:.2f}")
+            stage = 1
+    # stage 1 -> 2: at +1.5R take half off, trail the rest
+    if (state.get("tp_stage") or 0) == 1 and r >= 1.5:
+        half = round_down(amt / 2, QTY_STEP)
+        if half > 0 and half * price >= MIN_NOTIONAL:
+            try:
+                close_market(side, half)
+                state["tp_stage"] = 2
+                state["trail_peak_r"] = max(
+                    state.get("trail_peak_r") or 0.0, r)
+                # no fixed TP anymore; the trailing stop rides it
+                tp_o = find_tp_order(orders, exit_side)
+                if tp_o:
+                    try:
+                        cancel_order(tp_o.get("orderId"))
+                        log("  TP cancelled, trailing stop rides")
+                    except Exception as e:
+                        log(f"  TP cancel failed: {e}")
+                save_state(state)
+                log(f"  STAGE 2: took half off ({half:.3f}) "
+                    f"at R={r:.2f}")
+            except Exception as e:
+                log(f"  STAGE 2 half-close FAILED: {e}")
+    # stage 2: trail the stop 0.5R behind the best R reached
+    if (state.get("tp_stage") or 0) == 2:
+        peak = max(state.get("trail_peak_r") or 0.0, r)
+        if peak > (state.get("trail_peak_r") or 0.0):
+            state["trail_peak_r"] = peak
+            save_state(state)
+        new_stop = trail_stop_price(side, entry, dist, peak)
+        cur_stop = state.get("open_stop")
+        better = (new_stop > cur_stop if side == "LONG"
+                  else new_stop < cur_stop) if cur_stop else True
+        if better:
+            if replace_stop(state, side, new_stop):
+                save_state(state)
+                log(f"  TRAIL: stop moved to {new_stop:.2f} "
+                    f"(peak R={peak:.2f})")
+    # --- TP sync (stage 0/1 only): a TP limit must exist for the
+    # full current size at the stored level
+    if (state.get("tp_stage") or 0) < 2 and state.get("open_tp"):
+        tp_o = find_tp_order(orders, exit_side)
+        if tp_o is None:
+            try:
+                place_tp_limit(side, amt, float(state["open_tp"]))
+            except Exception as e:
+                log(f"  TP re-place FAILED: {e}")
+        else:
+            try:
+                have_qty = float(tp_o.get("origQty", 0) or 0)
+            except Exception:
+                have_qty = 0
+            if have_qty + 1e-9 < amt:
+                try:
+                    cancel_order(tp_o.get("orderId"))
+                    place_tp_limit(side, amt, float(state["open_tp"]))
+                except Exception as e:
+                    log(f"  TP re-size FAILED: {e}")
+
+
 def main():
     global HEDGE
     acct = signed("/fapi/v2/account")
-    log(f"bot v1.3 start | canTrade={acct.get('canTrade')} "
+    log(f"bot v1.4 start | canTrade={acct.get('canTrade')} "
         f"wallet={acct.get('totalWalletBalance')}")
     if not acct.get("canTrade"):
         log("FATAL: canTrade is False, exiting")
@@ -408,167 +681,139 @@ def main():
                         f"-> no new trades today")
                     time.sleep(3600)
                     continue
+                # event days (v1.4 #7): no new entries on FOMC/CPI etc.
+                if utc_date_str() in NO_TRADE_DATES:
+                    if heartbeat % 30 == 0:
+                        log(f"event day {utc_date_str()}: no new entries")
+                    time.sleep(CHECK_SEC)
+                    continue
+                # weekly loss cap (v1.4 #5): -$15/week -> halt to Monday
+                if weekly_halt(state):
+                    if heartbeat % 30 == 0:
+                        log(f"weekly loss cap hit: pnl "
+                            f"${state.get('weekly_pnl', 0.0):.2f} "
+                            f"-> no new trades this week")
+                    time.sleep(3600)
+                    continue
                 # evaluate setup
                 rg = get_range()
                 price = rg["price"]
                 chg1h = (rg["last_close"] - rg["prev_close"]) / rg["prev_close"]
                 range_w = (rg["high24"] - rg["low24"]) / price
+                chg7 = get_weekly_change()
+                wk7 = f"{chg7 * 100:+.1f}%" if chg7 is not None else "?"
                 if heartbeat % 30 == 0:
-                    wk = get_weekly_trend()
                     log(f"watch price={price:.2f} 24h=[{rg['low24']:.2f},"
                         f"{rg['high24']:.2f}] width={range_w*100:.1f}% "
-                        f"1h_chg={chg1h*100:+.2f}% weekly={wk or '?'} "
+                        f"1h_chg={chg1h*100:+.2f}% 7d={wk7} "
+                        f"atr={rg['atr']:.2f} "
                         f"bal=${balance:.2f} pnl_bot=${bot_pnl:.2f} "
                         f"pnl_acct=${acct_pnl_today:.2f}")
                 # range too tight to fade: skip (avoid noise trading)
                 if range_w < 0.03:
                     time.sleep(CHECK_SEC)
                     continue
-                # SHORT: near 24h high, not surging up — and NOT in a
-                # weekly uptrend (v1.3: don't short a rising weekly)
-                if price >= rg["high24"] * 0.995 and chg1h < 0.01:
-                    wk = get_weekly_trend()
-                    if wk == "up" or wk is None:
-                        if heartbeat % 30 == 0:
-                            log(f"SKIP SHORT price={price:.2f}: weekly "
-                                f"{wk or 'unknown'}, no counter-trend "
-                                f"short")
-                        time.sleep(CHECK_SEC)
-                        continue
-                    stop = rg["high24"] * 1.012
-                    dist = stop - price
-                    qty = round_down(balance * RISK_PCT / dist, QTY_STEP)
-                    tp = price - 1.5 * dist
-                    if qty * price >= MIN_NOTIONAL and qty > 0:
-                        log(f"SETUP SHORT price={price:.2f} high24="
-                            f"{rg['high24']:.2f} stop={stop:.2f} "
-                            f"tp={tp:.2f} qty={qty:.3f} risk="
-                            f"${balance*RISK_PCT:.2f} weekly={wk}")
-                        # v1.1: snapshot account realized PnL at entry so
-                        # this trade's PnL = close snapshot minus this one
-                        state["entry_pnl"] = acct_pnl_today
-                        state["entry_date"] = utc_date_str()
-                        state["open_stop"] = round(stop, 2)
-                        state["open_tp"] = round(tp, 2)
-                        state["open_side"] = "SHORT"
-                        avg, stop_ok = open_trade(
-                            "SHORT", qty, round(stop, 2), round(tp, 2))
-                        if not stop_ok:
-                            log("ENTRY ABORTED: stop could not be "
-                                "placed, position closed")
-                            if get_position()["amt"] == 0:
-                                state["entry_pnl"] = None
-                                state["entry_date"] = None
-                                state["open_stop"] = None
-                                state["open_tp"] = None
-                                state["open_side"] = None
-                        state["trades"] = state.get("trades", 0) + 1
-                        save_state(state)
-                # LONG: near 24h low, not plunging — and NOT in a
-                # weekly downtrend (v1.3: don't long a falling weekly)
-                elif price <= rg["low24"] * 1.005 and chg1h > -0.01:
-                    wk = get_weekly_trend()
-                    if wk == "down" or wk is None:
-                        if heartbeat % 30 == 0:
-                            log(f"SKIP LONG price={price:.2f}: weekly "
-                                f"{wk or 'unknown'}, no counter-trend "
-                                f"long")
-                        time.sleep(CHECK_SEC)
-                        continue
-                    stop = rg["low24"] * 0.988
-                    dist = price - stop
-                    qty = round_down(balance * RISK_PCT / dist, QTY_STEP)
-                    tp = price + 1.5 * dist
-                    if qty * price >= MIN_NOTIONAL and qty > 0:
-                        log(f"SETUP LONG price={price:.2f} low24="
-                            f"{rg['low24']:.2f} stop={stop:.2f} "
-                            f"tp={tp:.2f} qty={qty:.3f} risk="
-                            f"${balance*RISK_PCT:.2f} weekly={wk}")
-                        # v1.1: snapshot account realized PnL at entry (see
-                        # SHORT branch) so only this trade's PnL counts
-                        state["entry_pnl"] = acct_pnl_today
-                        state["entry_date"] = utc_date_str()
-                        state["open_stop"] = round(stop, 2)
-                        state["open_tp"] = round(tp, 2)
-                        state["open_side"] = "LONG"
-                        avg, stop_ok = open_trade(
-                            "LONG", qty, round(stop, 2), round(tp, 2))
-                        if not stop_ok:
-                            log("ENTRY ABORTED: stop could not be "
-                                "placed, position closed")
-                            if get_position()["amt"] == 0:
-                                state["entry_pnl"] = None
-                                state["entry_date"] = None
-                                state["open_stop"] = None
-                                state["open_tp"] = None
-                                state["open_side"] = None
-                        state["trades"] = state.get("trades", 0) + 1
-                        save_state(state)
+                # wild 1h moves (event-driven chop): skip the signal
+                if abs(chg1h) > 0.02:
+                    if heartbeat % 30 == 0:
+                        log(f"SKIP: 1h move {chg1h * 100:+.2f}% too wild")
+                    time.sleep(CHECK_SEC)
+                    continue
+                # weekly change unknown: fail closed
+                if chg7 is None:
+                    if heartbeat % 30 == 0:
+                        log("SKIP: weekly change unknown, fail closed")
+                    time.sleep(CHECK_SEC)
+                    continue
+                # regime (v1.4 #1): chop -> fade the range edges;
+                # trend -> only pullback entries WITH the trend
+                regime = "trend" if abs(chg7) > REGIME_CHG else "chop"
+                # risk per trade: halve after 2 consecutive losses (#5)
+                risk_pct = (RISK_PCT / 2
+                            if state.get("consec_losses", 0) >= 2
+                            else RISK_PCT)
+                # momentum confirmation (v1.4 #2): this hour's candle
+                # must agree with the trade direction
+                bull_hour = price > rg["cur_open"]
+                bear_hour = price < rg["cur_open"]
+                side = None
+                if regime == "chop":
+                    if (price >= rg["high24"] * 0.995
+                            and chg1h < 0.01 and bear_hour):
+                        side = "SHORT"
+                    elif (price <= rg["low24"] * 1.005
+                            and chg1h > -0.01 and bull_hour):
+                        side = "LONG"
+                else:
+                    if (chg7 > 0 and price <= rg["low24"] * 1.005
+                            and chg1h > -0.01 and bull_hour):
+                        side = "LONG"
+                    elif (chg7 < 0 and price >= rg["high24"] * 0.995
+                            and chg1h < 0.01 and bear_hour):
+                        side = "SHORT"
+                if side is None:
+                    time.sleep(CHECK_SEC)
+                    continue
+                # ATR-adaptive stop (v1.4 #6): distance is the larger of
+                # the range-edge distance and 1x ATR(14, 1h)
+                if side == "SHORT":
+                    edge_dist = rg["high24"] * 1.012 - price
+                    stop = price + max(edge_dist, rg["atr"])
+                else:
+                    edge_dist = price - rg["low24"] * 0.988
+                    stop = price - max(edge_dist, rg["atr"])
+                dist = abs(stop - price)
+                if dist <= 0:
+                    time.sleep(CHECK_SEC)
+                    continue
+                tp_mult = 1.5 if regime == "chop" else 2.0
+                tp = (price - tp_mult * dist if side == "SHORT"
+                      else price + tp_mult * dist)
+                full_qty = round_down(balance * risk_pct / dist, QTY_STEP)
+                if full_qty * price < MIN_NOTIONAL or full_qty <= 0:
+                    time.sleep(CHECK_SEC)
+                    continue
+                # scaled entry (v1.4 #4): open half now, half at +0.5R
+                qty = round_down(full_qty / 2, QTY_STEP)
+                if qty * price < MIN_NOTIONAL or qty <= 0:
+                    qty = full_qty
+                log(f"SETUP {side} price={price:.2f} regime={regime} "
+                    f"7d={wk7} stop={stop:.2f} tp={tp:.2f} "
+                    f"qty={qty:.3f}/{full_qty:.3f} "
+                    f"risk=${balance * risk_pct:.2f} atr={rg['atr']:.2f}")
+                # v1.1: snapshot account realized PnL at entry so this
+                # trade's PnL = close snapshot minus this one
+                state["entry_pnl"] = acct_pnl_today
+                state["entry_date"] = utc_date_str()
+                state["open_stop"] = round(stop, 2)
+                state["open_tp"] = round(tp, 2)
+                state["open_side"] = side
+                state["open_dist"] = round(dist, 2)
+                state["open_qty_full"] = full_qty
+                state["scale_done"] = False
+                state["tp_stage"] = 0
+                state["trail_peak_r"] = 0.0
+                state["stop_algo_id"] = None
+                avg, stop_ok = open_trade(
+                    side, qty, round(stop, 2), round(tp, 2), state)
+                if not stop_ok:
+                    log("ENTRY ABORTED: stop could not be placed, "
+                        "position closed")
+                    if get_position()["amt"] == 0:
+                        clear_trade_state(state)
+                state["trades"] = state.get("trades", 0) + 1
+                save_state(state)
             else:
-                # position open: make sure a stop order exists.
-                # Algo stops are invisible in openOrders — check both
-                # lists (v1.3; the old check alone falsely cried naked).
-                exit_side = "SELL" if pos["amt"] > 0 else "BUY"
-                has_stop = (
-                    any(o.get("type") == "STOP_MARKET" for o in orders)
-                    or any(o.get("type") in ("STOP_MARKET", "STOP")
-                           and o.get("side") == exit_side
-                           for o in algo_orders))
-                if not has_stop:
-                    log(f"WARNING: open position {pos['amt']} but NO stop "
-                        f"order! entry={pos['entry']} unrealized="
-                        f"{pos['unrealized']:.2f}")
-                    # re-place a stop: stored level if we have one,
-                    # else 2% beyond entry against the position
-                    stop = state.get("open_stop") or (
-                        pos["entry"] * 0.98 if pos["amt"] > 0
-                        else pos["entry"] * 1.02)
-                    try:
-                        place_stop(pos["side"], round(float(stop), 2))
-                        state["stop_fail_streak"] = 0
-                        save_state(state)
-                        log(f"  emergency stop placed at {stop:.2f}")
-                    except Exception as e:
-                        streak = state.get("stop_fail_streak", 0) + 1
-                        state["stop_fail_streak"] = streak
-                        save_state(state)
-                        log(f"  emergency stop FAILED (streak {streak}): {e}")
-                        if streak >= 3:
-                            # fail-safe: a position that cannot be
-                            # protected is closed, not held naked.
-                            log("  CRITICAL: no stop after 3 attempts, "
-                                "closing position now")
-                            try:
-                                close_market(pos["side"],
-                                             abs(pos["amt"]))
-                                state["stop_fail_streak"] = 0
-                                save_state(state)
-                            except Exception as e2:
-                                log(f"  CRITICAL: emergency close "
-                                    f"FAILED: {e2}")
-                # take-profit missing? re-place it from the stored level
-                has_tp = any(o.get("type") == "LIMIT"
-                             and o.get("side") == exit_side
-                             and o.get("reduceOnly") in (True, "true")
-                             for o in orders)
-                if not has_tp and state.get("open_tp"):
-                    try:
-                        t = place_order(
-                            symbol=SYMBOL, side=exit_side, type="LIMIT",
-                            price=f"{float(state['open_tp']):.2f}",
-                            quantity=f"{abs(pos['amt']):.3f}",
-                            timeInForce="GTC", reduceOnly="true",
-                            **_ps(pos["side"]))
-                        log(f"  TP re-placed orderId={t.get('orderId')} "
-                            f"tp={state['open_tp']}")
-                    except Exception as e:
-                        log(f"  TP re-place FAILED: {e}")
-                # detect close: position was open, now check realized pnl
+                try:
+                    price_now = get_range()["price"]
+                except Exception as e:
+                    log(f"price fetch failed: {e}")
+                    price_now = None
+                manage_open_position(pos, orders, algo_orders, state,
+                                     price_now)
                 if heartbeat % 10 == 0:
                     log(f"holding amt={pos['amt']} entry={pos['entry']} "
                         f"unrealized={pos['unrealized']:.2f}")
-                # if position closed externally, record it next loop via amt==0;
-                # mark close time when we see amt return to 0 (handled below)
             # track close: if we had a position last loop and now flat, log
             # (simplified: detect via state flag)
             if pos["amt"] != 0:
@@ -592,12 +837,22 @@ def main():
                     state["bot_pnl_today"] = state.get("bot_pnl_today",
                                                        0.0) + trade_pnl
                     # v1.3: count wins/losses (v1.2 never did)
+                    # v1.4 #5: consecutive losses + weekly PnL
+                    if state.get("weekly_pnl_week") != week_key():
+                        state["weekly_pnl_week"] = week_key()
+                        state["weekly_pnl"] = 0.0
+                    state["weekly_pnl"] = state.get("weekly_pnl",
+                                                    0.0) + trade_pnl
                     if trade_pnl > 0:
                         state["wins"] = state.get("wins", 0) + 1
+                        state["consec_losses"] = 0
                     elif trade_pnl < 0:
                         state["losses"] = state.get("losses", 0) + 1
+                        state["consec_losses"] = state.get(
+                            "consec_losses", 0) + 1
                     log(f"POSITION CLOSED. bot trade pnl=${trade_pnl:.2f} "
                         f"bot pnl today=${state['bot_pnl_today']:.2f} "
+                        f"weekly=${state['weekly_pnl']:.2f} "
                         f"(account realized today=${pnl_now:.2f})")
                 else:
                     log(f"POSITION CLOSED. bot trade pnl unknown "
@@ -605,12 +860,7 @@ def main():
                         f"mid-trade or trade crossed UTC midnight) "
                         f"-> not counted; account realized "
                         f"today=${pnl_now:.2f}")
-                state["entry_pnl"] = None
-                state["entry_date"] = None
-                state["open_stop"] = None
-                state["open_tp"] = None
-                state["open_side"] = None
-                state["stop_fail_streak"] = 0
+                clear_trade_state(state)
                 save_state(state)
 
             time.sleep(CHECK_SEC)
