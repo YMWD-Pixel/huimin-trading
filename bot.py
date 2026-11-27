@@ -58,6 +58,31 @@ Risk rules (hard):
     peak before breakeven -> exit). NOT copied: 20x all-in,
     cross-market rotation, no-stop wire-walking, holding through
     drawdowns, news-direction bets (no news feed).
+  - v1.6 (YM 2026-11-27: all 6 v2-research items + 1 small change):
+    TraderSZ / DonAlt / CryptoCred / Altcoin Sherpa / trader Yy
+    (see strategy-research-v2-20261127.md):
+    (1) higher-timeframe bias vote — monthly open + 200DMA + weekly,
+    trend pullback entries need 2 of 3 votes (chop-fade and
+    reversal trades unaffected);
+    (2) trend pullback needs the last completed 1h close back
+    inside the range edge (chop-fade and reversal unaffected);
+    (3) staged time risk — at 6h chop / 12h trend without +0.5R,
+    close half the position (stop unchanged);
+    (4) regime weekly lock — recomputed only Monday 00:00 UTC,
+    locked in state.json for the week;
+    (5) momentum-tiered TP — reaching +1R within 2h moves the
+    half-take to +2.5R, otherwise 1.5R (hypothesis: validated by
+    #6 stats; the fixed TP moves to the tp2 level at stage 1);
+    (6) per-thesis performance counting (chop-fade /
+    trend-pullback / reversal: trades, wins, pnl, avg_win_R,
+    avg_loss_R) with a Monday 00:00 UTC summary log; after 20
+    closed trades, a win rate < 40% logs a reminder to consider
+    TP 1.5R -> 1R (log only — the parameter change needs YM's
+    decision, never auto-applied);
+    small change: the v1.5 #6 fixed 5% width gate is now the
+    30-day volatility percentile (today's 24h width >= median of
+    the past 30 daily widths; falls back to fixed 5% if the
+    fetch fails).
   - balance < $50 -> halt everything and log;
   - max 1 open position; 2h cooldown after a close.
 Stdlib only. Reads key/secret from ~/.binance/credentials (mode 600).
@@ -179,7 +204,16 @@ def load_state():
                 "peak_r": 0.0, "close_reason": None,
                 "last_close_side": None, "last_close_regime": None,
                 "last_close_loss": None, "last_close_reason": None,
-                "last_withdraw_threshold": 100.0}
+                "last_withdraw_threshold": 100.0,
+                # v1.6 #4: regime locked for the UTC week
+                "regime_week": None, "regime": None,
+                # v1.6 #6: per-thesis stats + weekly summary key +
+                # one-shot TP-tighten reminder flag
+                "thesis_stats": {}, "thesis_weekly_key": None,
+                "tp_tighten_alerted": False,
+                # v1.6 per-trade: thesis type, half-reduce flag, tp2
+                "open_thesis_type": None, "half_reduced": False,
+                "tp2": 1.5}
 
 
 def rollover_bot_pnl(state):
@@ -262,6 +296,196 @@ def check_reversal(state, rg):
     return None
 
 
+def get_bias_votes(price, chg7):
+    """v1.6 #1: higher-timeframe bias vote (TraderSZ / Sherpa /
+    DonAlt). Weekly (v1.3 +/-1% band), monthly open, 200DMA — each
+    +1 (up), -1 (down) or 0 (flat/unavailable). One klines call:
+    daily limit 200 gives both the 200DMA and the monthly open
+    (the open of the first daily candle in the current UTC month).
+    A failed fetch leaves that vote at 0 (neutral) — with fewer
+    than 2 votes available a trend entry cannot pass, i.e. the
+    vote fails closed, like the v1.3 weekly filter."""
+    votes = {"weekly": 0, "monthly": 0, "dma200": 0}
+    if chg7 is not None:
+        if chg7 > 0.01:
+            votes["weekly"] = 1
+        elif chg7 < -0.01:
+            votes["weekly"] = -1
+    try:
+        kl = public("/fapi/v1/klines",
+                    {"symbol": SYMBOL, "interval": "1d", "limit": 200})
+        now = time.gmtime()
+        for k in kl:
+            t = time.gmtime(int(k[0]) / 1000)
+            if t.tm_year == now.tm_year and t.tm_mon == now.tm_mon:
+                m_open = float(k[1])
+                if price > m_open * 1.01:
+                    votes["monthly"] = 1
+                elif price < m_open * 0.99:
+                    votes["monthly"] = -1
+                break
+        closes = [float(k[4]) for k in kl]
+        if len(closes) >= 200:
+            dma200 = sum(closes[-200:]) / 200
+            if price > dma200 * 1.01:
+                votes["dma200"] = 1
+            elif price < dma200 * 0.99:
+                votes["dma200"] = -1
+    except Exception as e:
+        log(f"bias vote fetch failed: {e}")
+    return votes
+
+
+def bias_allows(votes, side):
+    """v1.6 #1: True if at least 2 of the 3 bias votes agree with
+    `side` (LONG wants +1, SHORT wants -1)."""
+    want = 1 if side == "LONG" else -1
+    return sum(1 for v in votes.values() if v == want) >= 2
+
+
+def pullback_confirmed(side, rg):
+    """v1.6 #2: the most recent COMPLETED 1h close must be back
+    inside the 24h range edge (LONG: close > low24; SHORT: close <
+    high24). closes[-1] is the current (incomplete) hour, so use
+    closes[-2]. A touch of the edge is not a confirmation (SZ:
+    clean break and hold; DonAlt: wait for the close)."""
+    closes = (rg or {}).get("closes") or []
+    if len(closes) < 2:
+        return False
+    last_done = closes[-2]
+    if side == "LONG":
+        return last_done > rg["low24"]
+    return last_done < rg["high24"]
+
+
+def width_gate_pass(range_w):
+    """v1.6 small change (Sherpa: only trade a coin that is
+    moving). Today's 24h range width must be at or above the
+    median of the past 30 completed daily widths. On fetch
+    failure, fall back to the old fixed 5% rule (v1.5 #6)."""
+    try:
+        kl = public("/fapi/v1/klines",
+                    {"symbol": SYMBOL, "interval": "1d", "limit": 31})
+        widths = []
+        for k in kl[:-1]:  # past 30 completed days, exclude today
+            c = float(k[4])
+            if c > 0:
+                widths.append((float(k[2]) - float(k[3])) / c)
+        if len(widths) < 10:
+            return True
+        widths.sort()
+        return range_w >= widths[len(widths) // 2]
+    except Exception as e:
+        log(f"width percentile fetch failed, using fixed 5%: {e}")
+        return range_w >= 0.05
+
+
+def locked_regime(state, chg7):
+    """v1.6 #4 (DonAlt): regime is recomputed only when the UTC
+    week rolls over (Monday 00:00 UTC) and locked in state.json
+    for the rest of the week. If the weekly change cannot be
+    fetched, the previous lock is kept (fail closed); on the very
+    first run with no lock, fall back to the live value."""
+    wk = week_key()
+    if state.get("regime_week") != wk and chg7 is not None:
+        state["regime_week"] = wk
+        state["regime"] = "trend" if abs(chg7) > REGIME_CHG else "chop"
+        log(f"REGIME LOCK: week {wk} regime={state['regime']} "
+            f"(7d {chg7 * 100:+.1f}%)")
+        save_state(state)
+    locked = state.get("regime")
+    if locked in ("chop", "trend"):
+        return locked
+    if chg7 is None:
+        return "chop"
+    return "trend" if abs(chg7) > REGIME_CHG else "chop"
+
+
+def record_thesis_result(state, ttype, pnl, r):
+    """v1.6 #6: per-thesis performance counting (CryptoCred:
+    review before prediction). R is the trade's outcome in units
+    of the planned risk (open_dist * open_qty_full), so a trade
+    that never scaled in and won 1.5R on half size correctly
+    scores 0.75R. win_r_sum / loss_r_sum are running sums kept
+    only to compute the averages."""
+    stats = state.setdefault("thesis_stats", {})
+    s = stats.setdefault(ttype, {"trades": 0, "wins": 0, "losses": 0,
+                                 "pnl": 0.0, "avg_win_R": 0.0,
+                                 "avg_loss_R": 0.0, "win_r_sum": 0.0,
+                                 "loss_r_sum": 0.0})
+    s["trades"] += 1
+    s["pnl"] = round(s["pnl"] + pnl, 2)
+    if pnl > 0:
+        s["wins"] += 1
+        s["win_r_sum"] = round(s["win_r_sum"] + r, 4)
+        s["avg_win_R"] = round(s["win_r_sum"] / s["wins"], 3)
+    elif pnl < 0:
+        s["losses"] += 1
+        s["loss_r_sum"] = round(s["loss_r_sum"] + r, 4)
+        s["avg_loss_R"] = round(s["loss_r_sum"] / s["losses"], 3)
+    save_state(state)
+
+
+def check_tp_tighten_trigger(state):
+    """v1.6 #6: after 20 closed trades, a win rate < 40% means our
+    low-win-rate / high-R profile is not paying — log a reminder
+    to consider tightening TP 1.5R -> 1R (towards the Yy / 熬鹰
+    high-win-rate profile). LOG ONLY: the parameter is never
+    changed automatically; that decision needs YM. Alerts once
+    per dip below 40%; the flag clears if the win rate recovers."""
+    stats = state.get("thesis_stats") or {}
+    total = sum(s.get("trades", 0) for s in stats.values())
+    wins = sum(s.get("wins", 0) for s in stats.values())
+    if total < 20:
+        return
+    wr = wins / total
+    if wr < 0.40:
+        if not state.get("tp_tighten_alerted"):
+            state["tp_tighten_alerted"] = True
+            log(f"THESIS ALERT: {total} closed trades, win rate "
+                f"{wr * 100:.0f}% < 40% — consider tightening TP "
+                f"1.5R -> 1R (manual decision, NOT auto-applied; "
+                f"ask YM before changing)")
+            save_state(state)
+    elif state.get("tp_tighten_alerted"):
+        state["tp_tighten_alerted"] = False
+        save_state(state)
+
+
+def maybe_log_thesis_weekly(state, now=None):
+    """v1.6 #6: every Monday 00:00 UTC (first loop after the week
+    rolls over), log a per-thesis summary for review. `now` is
+    injectable for tests; main() calls it without arguments."""
+    now = now or time.gmtime()
+    if now.tm_wday != 0:
+        return
+    wk = time.strftime("%Y-W%W", now)
+    if state.get("thesis_weekly_key") == wk:
+        return
+    state["thesis_weekly_key"] = wk
+    stats = state.get("thesis_stats") or {}
+    parts = []
+    tot_t = tot_w = 0
+    tot_p = 0.0
+    for ttype in ("chop-fade", "trend-pullback", "reversal"):
+        s = stats.get(ttype)
+        if not s:
+            continue
+        tot_t += s["trades"]
+        tot_w += s["wins"]
+        tot_p += s["pnl"]
+        parts.append(f"{ttype} {s['trades']} trades {s['wins']}W "
+                     f"pnl ${s['pnl']:+.2f} avg_win "
+                     f"{s['avg_win_R']:+.2f}R avg_loss "
+                     f"{s['avg_loss_R']:+.2f}R")
+    wr = (tot_w / tot_t * 100) if tot_t else 0.0
+    log("THESIS WEEKLY: "
+        + (" | ".join(parts) if parts else "no closed trades yet")
+        + f" | overall {tot_t} trades win rate {wr:.0f}% "
+        f"pnl ${tot_p:+.2f}")
+    save_state(state)
+
+
 def clear_trade_state(state):
     """Reset all per-trade fields (on close or aborted entry).
     last_close_* are NOT cleared — the next trade may need them
@@ -283,6 +507,11 @@ def clear_trade_state(state):
     state["open_thesis"] = None
     state["peak_r"] = 0.0
     state["close_reason"] = None
+    # v1.6 per-trade fields (thesis_stats / regime lock / weekly key
+    # are NOT per-trade and are kept)
+    state["open_thesis_type"] = None
+    state["half_reduced"] = False
+    state["tp2"] = 1.5
 
 
 def save_state(s):
@@ -628,6 +857,41 @@ def manage_open_position(pos, orders, algo_orders, state, price, rg=None):
         except Exception as e:
             log(f"  REVERSAL close FAILED: {e}")
         return
+    # --- staged time risk (v1.6 #3, CryptoCred: time management is
+    # graded, not just an expiry). At the halfway point (6h chop /
+    # 12h trend) still below +0.5R, close half the position. The
+    # rest keeps its stop (algo stop is closePosition, so it covers
+    # the remaining size) and the TP is re-placed for the remaining
+    # size. Returns here: next minute re-reads the position.
+    if stage == 0 and not state.get("half_reduced") and state.get("open_ts"):
+        age_h = (time.time() - state["open_ts"]) / 3600
+        limit_h = 12 if state.get("open_regime") == "trend" else 6
+        if age_h > limit_h and r < 0.5:
+            half = round_down(amt / 2, QTY_STEP)
+            if half > 0 and half * price >= MIN_NOTIONAL:
+                try:
+                    close_market(side, half)
+                    state["half_reduced"] = True
+                    tp_o = find_tp_order(orders, exit_side)
+                    if tp_o:
+                        try:
+                            cancel_order(tp_o.get("orderId"))
+                        except Exception as e:
+                            log(f"  TP cancel after half-reduce "
+                                f"failed: {e}")
+                    if state.get("open_tp"):
+                        try:
+                            place_tp_limit(side, amt - half,
+                                           float(state["open_tp"]))
+                        except Exception as e:
+                            log(f"  TP re-place after half-reduce "
+                                f"FAILED: {e} (sync will retry)")
+                    save_state(state)
+                    log(f"  HALF-REDUCE: {age_h:.1f}h without +0.5R, "
+                        f"closed half ({half:.3f}) at R={r:.2f}")
+                except Exception as e:
+                    log(f"  HALF-REDUCE close FAILED: {e}")
+                return
     # --- scale-in (v1.4 #4, v1.5 #3): add the second half only after
     # TWO consecutive completed 1h closes beyond +0.5R (confirmed,
     # not merely touched). closes[-1] is the current (incomplete)
@@ -680,16 +944,47 @@ def manage_open_position(pos, orders, algo_orders, state, price, rg=None):
     # --- staged take-profit (v1.4 #3)
     # stage 0 -> 1: at +1R move the stop to breakeven
     if stage == 0 and r >= 1.0:
+        # v1.6 #5: momentum-tiered TP — how fast the trade reached
+        # +1R decides the half-take level: <= 2h (strong momentum)
+        # -> 2.5R, otherwise 1.5R. This is a HYPOTHESIS (report
+        # §4 #5): validated later by the #6 thesis stats; if fast
+        # trades do not outperform slow ones, this rule is removed.
+        t1r_h = ((time.time() - state["open_ts"]) / 3600
+                 if state.get("open_ts") else None)
+        tp2 = 2.5 if (t1r_h is not None and t1r_h <= 2) else 1.5
+        state["tp2"] = tp2
         if replace_stop(state, side, entry):
             state["tp_stage"] = 1
             state["trail_peak_r"] = max(
                 state.get("trail_peak_r") or 0.0, r)
+            # move the fixed TP to the tp2 level: otherwise the TP
+            # limit placed at entry (1.5R chop / 2.0R trend) would
+            # cap a fast trade at 1.5R, or leave a slow trend trade
+            # capped at 2.0R while the half-take is at 1.5R.
+            new_tp = (entry + tp2 * dist if side == "LONG"
+                      else entry - tp2 * dist)
+            if (state.get("open_tp") is not None
+                    and abs(new_tp - float(state["open_tp"])) > 0.005):
+                tp_o = find_tp_order(orders, exit_side)
+                if tp_o:
+                    try:
+                        cancel_order(tp_o.get("orderId"))
+                    except Exception as e:
+                        log(f"  TP cancel for tp2 move failed: {e}")
+                try:
+                    place_tp_limit(side, amt, round(new_tp, 2))
+                    state["open_tp"] = round(new_tp, 2)
+                except Exception as e:
+                    log(f"  TP move to tp2 FAILED: {e} "
+                        f"(sync will retry)")
             save_state(state)
+            t1r_s = f"{t1r_h:.1f}h" if t1r_h is not None else "?"
             log(f"  STAGE 1: stop moved to breakeven {entry:.2f} "
-                f"at R={r:.2f}")
+                f"at R={r:.2f} "
+                f"(time to +1R: {t1r_s}, tp2={tp2}R)")
             stage = 1
-    # stage 1 -> 2: at +1.5R take half off, trail the rest
-    if (state.get("tp_stage") or 0) == 1 and r >= 1.5:
+    # stage 1 -> 2: at +tp2 R take half off, trail the rest
+    if (state.get("tp_stage") or 0) == 1 and r >= state.get("tp2", 1.5):
         half = round_down(amt / 2, QTY_STEP)
         if half > 0 and half * price >= MIN_NOTIONAL:
             try:
@@ -747,12 +1042,21 @@ def manage_open_position(pos, orders, algo_orders, state, price, rg=None):
                     place_tp_limit(side, amt, float(state["open_tp"]))
                 except Exception as e:
                     log(f"  TP re-size FAILED: {e}")
+            elif have_qty > amt + 1e-9:
+                # v1.6 #3: the position shrank (half-reduce) but the
+                # TP still covers the old size — shrink it so the TP
+                # can never close more than the position.
+                try:
+                    cancel_order(tp_o.get("orderId"))
+                    place_tp_limit(side, amt, float(state["open_tp"]))
+                except Exception as e:
+                    log(f"  TP shrink FAILED: {e}")
 
 
 def main():
     global HEDGE
     acct = signed("/fapi/v2/account")
-    log(f"bot v1.5 start | canTrade={acct.get('canTrade')} "
+    log(f"bot v1.6 start | canTrade={acct.get('canTrade')} "
         f"wallet={acct.get('totalWalletBalance')}")
     if not acct.get("canTrade"):
         log("FATAL: canTrade is False, exiting")
@@ -788,6 +1092,8 @@ def main():
                 continue
             # withdrawal recommendation (v1.5 #1)
             check_withdrawal(state, balance)
+            # v1.6 #6: Monday thesis summary (no-op other days)
+            maybe_log_thesis_weekly(state)
 
             pos = get_position()
             orders = get_open_orders()
@@ -850,13 +1156,6 @@ def main():
                 range_w = (rg["high24"] - rg["low24"]) / price
                 chg7 = get_weekly_change()
                 wk7 = f"{chg7 * 100:+.1f}%" if chg7 is not None else "?"
-                if heartbeat % 30 == 0:
-                    log(f"watch price={price:.2f} 24h=[{rg['low24']:.2f},"
-                        f"{rg['high24']:.2f}] width={range_w*100:.1f}% "
-                        f"1h_chg={chg1h*100:+.2f}% 7d={wk7} "
-                        f"atr={rg['atr']:.2f} "
-                        f"bal=${balance:.2f} pnl_bot=${bot_pnl:.2f} "
-                        f"pnl_acct=${acct_pnl_today:.2f}")
                 # range too tight to fade: skip (avoid noise trading)
                 if range_w < 0.03:
                     time.sleep(CHECK_SEC)
@@ -873,16 +1172,27 @@ def main():
                         log("SKIP: weekly change unknown, fail closed")
                     time.sleep(CHECK_SEC)
                     continue
-                # regime (v1.4 #1): chop -> fade the range edges;
-                # trend -> only pullback entries WITH the trend
-                regime = "trend" if abs(chg7) > REGIME_CHG else "chop"
-                # quality gate (v1.5 #6): narrow chop days are watch
-                # only — 90% waiting. Reversal trades bypass it.
-                if (not reversal and range_w < 0.05
-                        and abs(chg7) <= REGIME_CHG):
+                # regime (v1.4 #1, v1.6 #4): chop -> fade the range
+                # edges; trend -> only pullback entries WITH the
+                # trend. Locked for the UTC week (Monday 00:00 UTC),
+                # not recomputed every minute.
+                regime = locked_regime(state, chg7)
+                if heartbeat % 30 == 0:
+                    log(f"watch price={price:.2f} 24h=[{rg['low24']:.2f},"
+                        f"{rg['high24']:.2f}] width={range_w*100:.1f}% "
+                        f"1h_chg={chg1h*100:+.2f}% 7d={wk7} "
+                        f"regime={regime} "
+                        f"atr={rg['atr']:.2f} "
+                        f"bal=${balance:.2f} pnl_bot=${bot_pnl:.2f} "
+                        f"pnl_acct=${acct_pnl_today:.2f}")
+                # quality gate (v1.5 #6, v1.6: fixed 5% width ->
+                # 30-day volatility percentile): narrow chop days are
+                # watch only — 90% waiting. Reversal trades bypass it.
+                if (not reversal and regime == "chop"
+                        and not width_gate_pass(range_w)):
                     if heartbeat % 30 == 0:
                         log(f"SKIP: no-story day, range {range_w*100:.1f}% "
-                            f"7d {chg7*100:+.1f}% — watching only")
+                            f"below 30d median — watching only")
                     time.sleep(CHECK_SEC)
                     continue
                 # risk per trade: ladder by balance (v1.5 #5), halved
@@ -915,6 +1225,31 @@ def main():
                     elif (chg7 < 0 and price >= rg["high24"] * 0.995
                             and chg1h < 0.01 and bear_hour):
                         side = "SHORT"
+                    if side is not None:
+                        # v1.6 #2: the last completed 1h close must be
+                        # back inside the range edge — a touch is not
+                        # a confirmation (SZ / DonAlt).
+                        if not pullback_confirmed(side, rg):
+                            log(f"SKIP: trend {side} pullback not "
+                                f"confirmed (last 1h close still "
+                                f"outside range edge)")
+                            side = None
+                        else:
+                            # v1.6 #1: bias vote — 2 of 3 higher-
+                            # timeframe votes must agree with the side.
+                            votes = get_bias_votes(price, chg7)
+                            want = 1 if side == "LONG" else -1
+                            n = sum(1 for v in votes.values()
+                                    if v == want)
+                            vnames = {1: "up", -1: "down", 0: "flat"}
+                            log(f"bias: weekly {vnames[votes['weekly']]} / "
+                                f"monthly {vnames[votes['monthly']]} / "
+                                f"dma200 {vnames[votes['dma200']]} "
+                                f"-> {n}/3")
+                            if n < 2:
+                                log(f"bias BLOCKED trend {side}: "
+                                    f"{n}/3 votes (need 2)")
+                                side = None
                 if side is None:
                     time.sleep(CHECK_SEC)
                     continue
@@ -983,6 +1318,13 @@ def main():
                 state["open_ts"] = time.time()
                 state["open_regime"] = regime
                 state["open_thesis"] = thesis
+                # v1.6 #6: thesis type for per-thesis counting
+                state["open_thesis_type"] = (
+                    "reversal" if reversal else
+                    "chop-fade" if regime == "chop" else
+                    "trend-pullback")
+                state["half_reduced"] = False  # v1.6 #3
+                state["tp2"] = 1.5             # v1.6 #5
                 state["peak_r"] = 0.0
                 state["close_reason"] = None
                 avg, stop_ok = open_trade(
@@ -1052,7 +1394,23 @@ def main():
                     state["last_close_reason"] = (
                         state.get("close_reason")
                         or ("stop" if trade_pnl < 0 else "tp"))
+                    # v1.6 #6: per-thesis performance counting. R is
+                    # measured against the planned risk
+                    # (open_dist * open_qty_full). Unattributed closes
+                    # (no same-day snapshot) are not recorded.
+                    r_out = 0.0
+                    ttype = state.get("open_thesis_type")
+                    if (ttype and state.get("open_dist")
+                            and state.get("open_qty_full")):
+                        risk_usd = (float(state["open_dist"])
+                                    * float(state["open_qty_full"]))
+                        r_out = (trade_pnl / risk_usd
+                                 if risk_usd > 0 else 0.0)
+                        record_thesis_result(state, ttype, trade_pnl,
+                                             r_out)
+                        check_tp_tighten_trigger(state)
                     log(f"POSITION CLOSED. bot trade pnl=${trade_pnl:.2f} "
+                        f"R={r_out:+.2f} "
                         f"bot pnl today=${state['bot_pnl_today']:.2f} "
                         f"weekly=${state['weekly_pnl']:.2f} "
                         f"(account realized today=${pnl_now:.2f}) "
