@@ -4,7 +4,7 @@ Style: 熬鹰 (see trading-style-aoying.md + aoying-full-records-20261127.md)
 + 法师 Tony (see strategy-research-20261127.md):
   - event-driven / range "打地鼠": fade the edges of the recent 24h range,
     only when momentum is NOT running away (no breakout chasing);
-  - low leverage (3x), every trade has a stop-loss, bank profits;
+  - low leverage (5x), every trade has a stop-loss, bank profits;
   - no setup = no trade. Empty positions are also a position.
 Risk rules (hard):
   - max 2% of balance risked per trade; stop-loss on every trade;
@@ -107,7 +107,7 @@ LOG_FILE = os.path.join(HERE, "trades.log")
 STOP_FILE = os.path.join(HERE, "STOP")
 
 SYMBOL = "ETHUSDT"
-LEVERAGE = 3
+LEVERAGE = 5
 RISK_PCT = 0.02          # max risk per trade, fraction of balance
 DAILY_LOSS_CAP = 5.0     # USD
 STOP_BALANCE = 50.0      # halt below this
@@ -1056,7 +1056,7 @@ def manage_open_position(pos, orders, algo_orders, state, price, rg=None):
 def main():
     global HEDGE
     acct = signed("/fapi/v2/account")
-    log(f"bot v1.6 start | canTrade={acct.get('canTrade')} "
+    log(f"bot v1.6.1 start | canTrade={acct.get('canTrade')} "
         f"wallet={acct.get('totalWalletBalance')}")
     if not acct.get("canTrade"):
         log("FATAL: canTrade is False, exiting")
