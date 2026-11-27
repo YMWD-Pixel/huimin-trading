@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Huimin trading bot v1.4 — Binance USDT-margined futures, ETHUSDT only.
-Style: 熬鹰 (see trading-style-aoying.md) + 法师 Tony (see
-strategy-research-20261127.md):
+"""Huimin trading bot v1.5 — Binance USDT-margined futures, ETHUSDT only.
+Style: 熬鹰 (see trading-style-aoying.md + aoying-full-records-20261127.md)
++ 法师 Tony (see strategy-research-20261127.md):
   - event-driven / range "打地鼠": fade the edges of the recent 24h range,
     only when momentum is NOT running away (no breakout chasing);
   - low leverage (3x), every trade has a stop-loss, bank profits;
@@ -44,6 +44,20 @@ Risk rules (hard):
     half at +0.5R); loss circuit breakers (risk halves after 2
     consecutive losses, weekly PnL -$15 halts until Monday);
     ATR-adaptive stops; event-day blacklist (no new entries).
+  - v1.5 (YM 2026-11-27: all 8 熬鹰 items): withdrawal rule —
+    recommend withdrawing each $25 step above $100 when the week
+    is profitable (bot never moves funds itself); one-sentence
+    trade thesis logged at entry and reviewed at close; confirmed
+    scale-in (second half only after two consecutive 1h closes
+    beyond +0.5R); trade expiry (12h chop / 24h trend without
+    +1R -> exit); risk ladder by balance (2% <$100, 1.5% $100-500,
+    1% >$500, halved again after 2 consecutive losses); no-story
+    day frequency cut (narrow chop days: watch only); conditional
+    reversal (cooldown exception for a confirmed breakout after a
+    failed fade); momentum-reversal early exit (drop 0.75R from
+    peak before breakeven -> exit). NOT copied: 20x all-in,
+    cross-market rotation, no-stop wire-walking, holding through
+    drawdowns, news-direction bets (no news feed).
   - balance < $50 -> halt everything and log;
   - max 1 open position; 2h cooldown after a close.
 Stdlib only. Reads key/secret from ~/.binance/credentials (mode 600).
@@ -79,6 +93,8 @@ PRICE_TICK = 0.01
 MIN_NOTIONAL = 5.0
 REGIME_CHG = 0.02        # |7d change| above this = trend market, else chop
 WEEKLY_LOSS_CAP = 15.0  # halt new trades for the week at this bot PnL
+WITHDRAW_BASE = 100.0   # keep this much working capital; recommend
+WITHDRAW_STEP = 25.0    # withdrawing each $25 step above it (v1.5 #1)
 # UTC dates with no new entries (FOMC/CPI etc.). Update monthly.
 NO_TRADE_DATES = {"2026-12-09", "2026-12-10"}
 
@@ -158,7 +174,12 @@ def load_state():
                 "open_dist": None, "open_qty_full": None,
                 "scale_done": False, "tp_stage": 0, "trail_peak_r": 0.0,
                 "stop_algo_id": None, "consec_losses": 0,
-                "weekly_pnl": 0.0, "weekly_pnl_week": None}
+                "weekly_pnl": 0.0, "weekly_pnl_week": None,
+                "open_ts": None, "open_regime": None, "open_thesis": None,
+                "peak_r": 0.0, "close_reason": None,
+                "last_close_side": None, "last_close_regime": None,
+                "last_close_loss": None, "last_close_reason": None,
+                "last_withdraw_threshold": 100.0}
 
 
 def rollover_bot_pnl(state):
@@ -184,8 +205,67 @@ def weekly_halt(state):
     return state.get("weekly_pnl", 0.0) <= -WEEKLY_LOSS_CAP
 
 
+def risk_pct_for(balance, state):
+    """Risk per trade, by balance ladder (v1.5 #5, 熬鹰: the bigger
+    the money, the lower the leverage). Halved again after 2
+    consecutive losses (v1.4 #5)."""
+    if balance >= 500:
+        base = 0.01
+    elif balance >= 100:
+        base = 0.015
+    else:
+        base = 0.02
+    if state.get("consec_losses", 0) >= 2:
+        base /= 2
+    return base
+
+
+def check_withdrawal(state, balance):
+    """v1.5 #1 (熬鹰: 提现才算赚到). When the balance crosses each
+    $25 step above $100 with a positive week, log a WITHDRAW
+    RECOMMEND. The bot never moves funds itself — withdrawal is
+    manual, YM approves. Logged so the agent picks it up during
+    checks and writes it into the ledger."""
+    if balance <= WITHDRAW_BASE:
+        return
+    threshold = (WITHDRAW_BASE
+                 + WITHDRAW_STEP * int((balance - WITHDRAW_BASE)
+                                       // WITHDRAW_STEP))
+    if threshold <= state.get("last_withdraw_threshold", 100.0):
+        return
+    if state.get("weekly_pnl", 0.0) <= 0:
+        return
+    state["last_withdraw_threshold"] = threshold
+    log(f"WITHDRAW RECOMMEND: balance ${balance:.2f} crossed "
+        f"${threshold:.0f}; consider withdrawing "
+        f"${balance - WITHDRAW_BASE:.2f} (keep "
+        f"${WITHDRAW_BASE:.0f} working capital). "
+        f"Withdrawal is manual — the bot never moves funds itself.")
+    save_state(state)
+
+
+def check_reversal(state, rg):
+    """v1.5 #7: after a chop fade stop-out, if the price has closed
+    beyond the broken edge by > 0.5%, the fade failed and the
+    breakout is real. Returns the breakout side ('LONG'/'SHORT')
+    or None. The price here is the latest 1h candle close."""
+    if not state.get("last_close_loss"):
+        return None
+    if state.get("last_close_regime") != "chop":
+        return None
+    last_side = state.get("last_close_side")
+    price = rg["price"]
+    if last_side == "SHORT" and price >= rg["high24"] * 1.005:
+        return "LONG"
+    if last_side == "LONG" and price <= rg["low24"] * 0.995:
+        return "SHORT"
+    return None
+
+
 def clear_trade_state(state):
-    """Reset all per-trade fields (on close or aborted entry)."""
+    """Reset all per-trade fields (on close or aborted entry).
+    last_close_* are NOT cleared — the next trade may need them
+    (v1.5 #7 reversal exception)."""
     state["entry_pnl"] = None
     state["entry_date"] = None
     state["open_stop"] = None
@@ -198,6 +278,11 @@ def clear_trade_state(state):
     state["trail_peak_r"] = 0.0
     state["stop_algo_id"] = None
     state["stop_fail_streak"] = 0
+    state["open_ts"] = None
+    state["open_regime"] = None
+    state["open_thesis"] = None
+    state["peak_r"] = 0.0
+    state["close_reason"] = None
 
 
 def save_state(s):
@@ -270,7 +355,7 @@ def get_range():
     return {"high24": max(highs), "low24": min(lows),
             "last_close": closes[-1], "prev_close": closes[-2],
             "price": closes[-1], "cur_open": float(kl[-1][1]),
-            "atr": atr_from_klines(kl)}
+            "atr": atr_from_klines(kl), "closes": closes}
 
 
 def get_weekly_change():
@@ -460,11 +545,13 @@ def open_trade(side, qty, stop_price, tp_price, state):
     return avg, True
 
 
-def manage_open_position(pos, orders, algo_orders, state, price):
+def manage_open_position(pos, orders, algo_orders, state, price, rg=None):
     """Manage an open position: stop protection, TP sync, scale-in,
     staged take-profit (breakeven -> half -> trailing stop).
     price may be None if the price fetch failed — then only the
-    stop check runs and the R-based logic is skipped this minute."""
+    stop check runs and the R-based logic is skipped this minute.
+    rg is the get_range() dict (needed for the scale-in candle
+    confirmation, v1.5 #3)."""
     side = pos["side"]
     exit_side = "SELL" if pos["amt"] > 0 else "BUY"
     amt = abs(pos["amt"])
@@ -510,12 +597,55 @@ def manage_open_position(pos, orders, algo_orders, state, price):
     # how far in profit, in R
     r = r_multiple(side, entry, price, dist)
     stage = state.get("tp_stage") or 0
-    # --- scale-in (v1.4 #4): at +0.5R add the second half, once.
-    # Only before any profit-taking. If the trade first goes -0.5R,
-    # no add.
+    # track the best R reached since entry (v1.5 #8)
+    peak_r = max(state.get("peak_r") or 0.0, r)
+    if peak_r > (state.get("peak_r") or 0.0):
+        state["peak_r"] = peak_r
+        save_state(state)
+    # --- trade expiry (v1.5 #4): chop 12h / trend 24h without +1R
+    if stage == 0 and state.get("open_ts"):
+        age_h = (time.time() - state["open_ts"]) / 3600
+        limit_h = 24 if state.get("open_regime") == "trend" else 12
+        if age_h > limit_h:
+            log(f"  EXPIRY: {age_h:.1f}h without +1R, closing")
+            state["close_reason"] = "expiry"
+            save_state(state)
+            try:
+                close_market(side, amt)
+            except Exception as e:
+                log(f"  EXPIRY close FAILED: {e}")
+            return
+    # --- momentum-reversal early exit (v1.5 #8): once the trade was
+    # +0.5R in profit, a 0.75R give-back means it is not going our
+    # way (proxy for 熬鹰's "感觉不对就平"). Only before breakeven.
+    if stage == 0 and peak_r >= 0.5 and r <= peak_r - 0.75:
+        log(f"  REVERSAL EXIT: R fell from peak {peak_r:.2f} to "
+            f"{r:.2f}, closing")
+        state["close_reason"] = "reversal"
+        save_state(state)
+        try:
+            close_market(side, amt)
+        except Exception as e:
+            log(f"  REVERSAL close FAILED: {e}")
+        return
+    # --- scale-in (v1.4 #4, v1.5 #3): add the second half only after
+    # TWO consecutive completed 1h closes beyond +0.5R (confirmed,
+    # not merely touched). closes[-1] is the current (incomplete)
+    # hour, so use closes[-2] and closes[-3]. If the trade first
+    # goes -0.5R, no add.
+    tp_synced = False
     if not state.get("scale_done") and stage == 0:
         full_qty = state.get("open_qty_full") or amt
-        if r >= 0.5 and amt < full_qty - 1e-9:
+        confirmed = False
+        closes = (rg or {}).get("closes") or []
+        if len(closes) >= 3 and dist:
+            if side == "LONG":
+                confirmed = (closes[-2] >= entry + 0.5 * dist
+                             and closes[-3] >= entry + 0.5 * dist)
+            else:
+                confirmed = (closes[-2] <= entry - 0.5 * dist
+                             and closes[-3] <= entry - 0.5 * dist)
+        if confirmed and amt < full_qty - 1e-9:
             add = round_down(full_qty - amt, QTY_STEP)
             if add > 0 and add * price >= MIN_NOTIONAL:
                 try:
@@ -537,6 +667,7 @@ def manage_open_position(pos, orders, algo_orders, state, price):
                         try:
                             place_tp_limit(side, full_qty,
                                            float(state["open_tp"]))
+                            tp_synced = True
                         except Exception as e:
                             log(f"  TP re-place after scale-in "
                                 f"FAILED: {e}")
@@ -595,8 +726,10 @@ def manage_open_position(pos, orders, algo_orders, state, price):
                 log(f"  TRAIL: stop moved to {new_stop:.2f} "
                     f"(peak R={peak:.2f})")
     # --- TP sync (stage 0/1 only): a TP limit must exist for the
-    # full current size at the stored level
-    if (state.get("tp_stage") or 0) < 2 and state.get("open_tp"):
+    # full current size at the stored level. Skipped if the scale-in
+    # block already re-placed it this minute (orders list is stale).
+    if (not tp_synced and (state.get("tp_stage") or 0) < 2
+            and state.get("open_tp")):
         tp_o = find_tp_order(orders, exit_side)
         if tp_o is None:
             try:
@@ -619,7 +752,7 @@ def manage_open_position(pos, orders, algo_orders, state, price):
 def main():
     global HEDGE
     acct = signed("/fapi/v2/account")
-    log(f"bot v1.4 start | canTrade={acct.get('canTrade')} "
+    log(f"bot v1.5 start | canTrade={acct.get('canTrade')} "
         f"wallet={acct.get('totalWalletBalance')}")
     if not acct.get("canTrade"):
         log("FATAL: canTrade is False, exiting")
@@ -653,6 +786,8 @@ def main():
                     f"-> no trading, will keep checking")
                 time.sleep(3600)
                 continue
+            # withdrawal recommendation (v1.5 #1)
+            check_withdrawal(state, balance)
 
             pos = get_position()
             orders = get_open_orders()
@@ -666,10 +801,19 @@ def main():
                 # flat: cancel any leftover stop/TP orders
                 if orders or algo_orders:
                     cancel_all()
-                # cooldown after a close
+                # cooldown after a close — with a reversal exception
+                # (v1.5 #7): a confirmed breakout after a failed fade
+                # may be traded immediately
+                reversal = None
                 if time.time() - state.get("last_close_ts", 0) < COOLDOWN_SEC:
-                    time.sleep(CHECK_SEC)
-                    continue
+                    try:
+                        reversal = check_reversal(state, get_range())
+                    except Exception as e:
+                        log(f"reversal check failed: {e}")
+                        reversal = None
+                    if not reversal:
+                        time.sleep(CHECK_SEC)
+                        continue
                 # daily loss cap — bot's own PnL only (v1.1). YM's manual
                 # trades no longer block the bot; account PnL is logged
                 # for reference only.
@@ -693,6 +837,10 @@ def main():
                         log(f"weekly loss cap hit: pnl "
                             f"${state.get('weekly_pnl', 0.0):.2f} "
                             f"-> no new trades this week")
+                        if balance > WITHDRAW_BASE:
+                            log(f"WITHDRAW CHECK: weekly halt hit — "
+                                f"withdraw any unwithdrawn profits "
+                                f"above ${WITHDRAW_BASE:.0f} first")
                     time.sleep(3600)
                     continue
                 # evaluate setup
@@ -728,16 +876,32 @@ def main():
                 # regime (v1.4 #1): chop -> fade the range edges;
                 # trend -> only pullback entries WITH the trend
                 regime = "trend" if abs(chg7) > REGIME_CHG else "chop"
-                # risk per trade: halve after 2 consecutive losses (#5)
-                risk_pct = (RISK_PCT / 2
-                            if state.get("consec_losses", 0) >= 2
-                            else RISK_PCT)
+                # quality gate (v1.5 #6): narrow chop days are watch
+                # only — 90% waiting. Reversal trades bypass it.
+                if (not reversal and range_w < 0.05
+                        and abs(chg7) <= REGIME_CHG):
+                    if heartbeat % 30 == 0:
+                        log(f"SKIP: no-story day, range {range_w*100:.1f}% "
+                            f"7d {chg7*100:+.1f}% — watching only")
+                    time.sleep(CHECK_SEC)
+                    continue
+                # risk per trade: ladder by balance (v1.5 #5), halved
+                # again after 2 consecutive losses (v1.4 #5)
+                risk_pct = risk_pct_for(balance, state)
                 # momentum confirmation (v1.4 #2): this hour's candle
                 # must agree with the trade direction
                 bull_hour = price > rg["cur_open"]
                 bear_hour = price < rg["cur_open"]
                 side = None
-                if regime == "chop":
+                if reversal:
+                    # confirmed breakout after a failed fade: trade it
+                    # as a trend entry (TP 2R, 24h expiry)
+                    if reversal == "LONG" and chg1h > -0.01 and bull_hour:
+                        side = "LONG"
+                    elif reversal == "SHORT" and chg1h < 0.01 and bear_hour:
+                        side = "SHORT"
+                    regime = "trend"
+                elif regime == "chop":
                     if (price >= rg["high24"] * 0.995
                             and chg1h < 0.01 and bear_hour):
                         side = "SHORT"
@@ -755,8 +919,16 @@ def main():
                     time.sleep(CHECK_SEC)
                     continue
                 # ATR-adaptive stop (v1.4 #6): distance is the larger of
-                # the range-edge distance and 1x ATR(14, 1h)
-                if side == "SHORT":
+                # the range-edge distance and 1x ATR(14, 1h). For a
+                # reversal trade the edge is the BROKEN one.
+                if reversal:
+                    if side == "LONG":
+                        edge_dist = price - rg["high24"] * 0.988
+                        stop = price - max(edge_dist, rg["atr"])
+                    else:
+                        edge_dist = rg["low24"] * 1.012 - price
+                        stop = price + max(edge_dist, rg["atr"])
+                elif side == "SHORT":
                     edge_dist = rg["high24"] * 1.012 - price
                     stop = price + max(edge_dist, rg["atr"])
                 else:
@@ -777,10 +949,24 @@ def main():
                 qty = round_down(full_qty / 2, QTY_STEP)
                 if qty * price < MIN_NOTIONAL or qty <= 0:
                     qty = full_qty
+                # one-sentence trade thesis (v1.5 #2): why, how, exit
+                expiry_h = 24 if regime == "trend" else 12
+                if reversal:
+                    trigger = (f"reversal breakout {side} after "
+                               f"{state.get('last_close_side')} stop-out")
+                elif regime == "chop":
+                    trigger = (f"fade {'high24' if side == 'SHORT' else 'low24'} "
+                               f"{rg['high24'] if side == 'SHORT' else rg['low24']:.2f}")
+                else:
+                    trigger = (f"pullback {'low24' if side == 'LONG' else 'high24'} "
+                               f"{rg['low24'] if side == 'LONG' else rg['high24']:.2f}")
+                thesis = (f"{regime} {side} {trigger} / exit: stop "
+                          f"{stop:.2f} or TP {tp:.2f} or {expiry_h}h expiry")
                 log(f"SETUP {side} price={price:.2f} regime={regime} "
                     f"7d={wk7} stop={stop:.2f} tp={tp:.2f} "
                     f"qty={qty:.3f}/{full_qty:.3f} "
-                    f"risk=${balance * risk_pct:.2f} atr={rg['atr']:.2f}")
+                    f"risk=${balance * risk_pct:.2f} atr={rg['atr']:.2f} "
+                    f"thesis: {thesis}")
                 # v1.1: snapshot account realized PnL at entry so this
                 # trade's PnL = close snapshot minus this one
                 state["entry_pnl"] = acct_pnl_today
@@ -794,6 +980,11 @@ def main():
                 state["tp_stage"] = 0
                 state["trail_peak_r"] = 0.0
                 state["stop_algo_id"] = None
+                state["open_ts"] = time.time()
+                state["open_regime"] = regime
+                state["open_thesis"] = thesis
+                state["peak_r"] = 0.0
+                state["close_reason"] = None
                 avg, stop_ok = open_trade(
                     side, qty, round(stop, 2), round(tp, 2), state)
                 if not stop_ok:
@@ -805,12 +996,13 @@ def main():
                 save_state(state)
             else:
                 try:
-                    price_now = get_range()["price"]
+                    rg_pos = get_range()
                 except Exception as e:
                     log(f"price fetch failed: {e}")
-                    price_now = None
+                    rg_pos = None
                 manage_open_position(pos, orders, algo_orders, state,
-                                     price_now)
+                                     rg_pos["price"] if rg_pos else None,
+                                     rg_pos)
                 if heartbeat % 10 == 0:
                     log(f"holding amt={pos['amt']} entry={pos['entry']} "
                         f"unrealized={pos['unrealized']:.2f}")
@@ -850,16 +1042,33 @@ def main():
                         state["losses"] = state.get("losses", 0) + 1
                         state["consec_losses"] = state.get(
                             "consec_losses", 0) + 1
+                    # v1.5 #7: remember how the last trade ended so a
+                    # confirmed breakout after a failed fade can bypass
+                    # the cooldown. A losing exchange close is a
+                    # stop-out; a winning one is a TP hit.
+                    state["last_close_side"] = state.get("open_side")
+                    state["last_close_regime"] = state.get("open_regime")
+                    state["last_close_loss"] = trade_pnl < 0
+                    state["last_close_reason"] = (
+                        state.get("close_reason")
+                        or ("stop" if trade_pnl < 0 else "tp"))
                     log(f"POSITION CLOSED. bot trade pnl=${trade_pnl:.2f} "
                         f"bot pnl today=${state['bot_pnl_today']:.2f} "
                         f"weekly=${state['weekly_pnl']:.2f} "
-                        f"(account realized today=${pnl_now:.2f})")
+                        f"(account realized today=${pnl_now:.2f}) "
+                        f"thesis: {state.get('open_thesis')}")
                 else:
+                    state["last_close_side"] = state.get("open_side")
+                    state["last_close_regime"] = state.get("open_regime")
+                    state["last_close_loss"] = None
+                    state["last_close_reason"] = (
+                        state.get("close_reason") or "unknown")
                     log(f"POSITION CLOSED. bot trade pnl unknown "
                         f"(no same-day entry snapshot, e.g. bot restarted "
                         f"mid-trade or trade crossed UTC midnight) "
                         f"-> not counted; account realized "
-                        f"today=${pnl_now:.2f}")
+                        f"today=${pnl_now:.2f} "
+                        f"thesis: {state.get('open_thesis')}")
                 clear_trade_state(state)
                 save_state(state)
 
