@@ -1,0 +1,9 @@
+{
+  "scheme": "sr25519",
+  "ss58Prefix": 42,
+  "network": "flop-testnet",
+  "agent": "慧敏",
+  "publicKeyHex": "0x40ca0232969f22cc3c62a3f1d8ef8e5f88e57c96a7f53b91e449452b649cf537",
+  "address": "5DXevwgi12ao1szL2Y9WHvSbDogZS4AcYzVrhKCZ6wCPUmdR",
+  "createdAt": "2026-11-26T11:54:40.517Z"
+}
